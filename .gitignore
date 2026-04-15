@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# uv
+uv.lock
+
+# forgekit artifacts
+outputs/
+checkpoints/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# direnv
+.envrc.local
+
+# nix
+result
+result-*

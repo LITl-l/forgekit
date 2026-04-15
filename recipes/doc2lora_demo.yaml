@@ -1,0 +1,25 @@
+name: doc2lora-demo
+model: mistralai/Mistral-7B-v0.3
+
+data:
+  kind: local_text
+  config:
+    path: ./example_docs/
+    glob: "*.md"
+
+trainer:
+  kind: doc2lora
+  config:
+    hypernet_ckpt: SakanaAI/doc-to-lora
+    adapter_rank: 8
+    adapter_alpha: 16
+
+evaluator:
+  kind: perplexity
+  config:
+    dataset: wikitext2
+
+exporter:
+  kind: gguf
+  config:
+    quant: q5_k_m

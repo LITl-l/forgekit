@@ -1,0 +1,40 @@
+name: llama3-8b-onecompression
+model: meta-llama/Meta-Llama-3-8B
+
+data:
+  kind: hf_dataset
+  config:
+    path: allenai/c4
+    name: en
+    split: train
+    streaming: true
+    num_calibration: 1024
+
+trainer:
+  kind: qlora
+  config:
+    backend: unsloth
+    lr: 1.0e-4
+    steps: 500
+    seq_len: 4096
+    lora_r: 32
+
+compressors:
+  - kind: onecompression
+    config:
+      mode: mixed_precision
+      autobit: true
+      target_avg_bits: 3.5
+      calibration_samples: 128
+
+evaluator:
+  kind: lm_eval_harness
+  config:
+    tasks: [hellaswag, arc_easy, mmlu]
+    batch_size: 8
+
+exporter:
+  kind: vllm
+  config:
+    attention_backend: triattention
+    kv_cache_dtype: fp8
