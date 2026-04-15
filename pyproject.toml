@@ -35,8 +35,22 @@ forgekit = "forgekit.cli:app"
 # plugin PRs pin the concrete upstream (PyPI name and minimum version) when
 # they land the implementation. Until then, each extra is a named placeholder
 # so users and CI can refer to it without resolution breakage.
-unsloth = []
-trl = []
+unsloth = [
+    "unsloth>=2024.8",
+    "trl>=0.9,<0.12",
+    "transformers>=4.43,<5",
+    "datasets>=2.19,<3",
+    "peft>=0.11,<0.13",
+    "accelerate>=0.30,<1",
+]
+trl = [
+    "trl>=0.9,<0.12",
+    "transformers>=4.43,<5",
+    "datasets>=2.19,<3",
+    "peft>=0.11,<0.13",
+    "accelerate>=0.30,<1",
+    "bitsandbytes>=0.43,<0.45",
+]
 torchtune = []
 onecompression = []
 gptq = []
