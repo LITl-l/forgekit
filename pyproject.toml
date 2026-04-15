@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forgekit"
+version = "0.0.1"
+description = "Research-incubator pipeline for local LLM development: data -> fine-tune -> compress -> eval -> serve."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "forgekit contributors" }]
+keywords = ["llm", "fine-tuning", "quantization", "lora", "qlora", "gguf", "vllm"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "pydantic>=2.6",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+forgekit = "forgekit.cli:app"
+
+[project.optional-dependencies]
+# Plugin extras are intentionally empty in the scaffold PR. The follow-up
+# plugin PRs pin the concrete upstream (PyPI name and minimum version) when
+# they land the implementation. Until then, each extra is a named placeholder
+# so users and CI can refer to it without resolution breakage.
+unsloth = []
+trl = []
+torchtune = []
+onecompression = []
+gptq = []
+awq = []
+hqq = []
+bnb = []
+aqlm = []
+doc2lora = []
+lm-eval = []
+gguf = []
+vllm = []
+mlx = []
+i-dlm = []
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "types-PyYAML",
+]
+
+[project.urls]
+Homepage = "https://github.com/LITl-l/forgekit"
+Issues = "https://github.com/LITl-l/forgekit/issues"
+
+[project.entry-points."forgekit.trainers"]
+qlora = "forgekit.plugins.trainers.qlora:QLoRATrainer"
+sft = "forgekit.plugins.trainers.sft:SFTTrainer"
+dpo = "forgekit.plugins.trainers.dpo:DPOTrainer"
+grpo = "forgekit.plugins.trainers.grpo:GRPOTrainer"
+full_finetune = "forgekit.plugins.trainers.full_finetune:FullFinetuneTrainer"
+qat = "forgekit.plugins.trainers.qat:QATTrainer"
+doc2lora = "forgekit.plugins.trainers.doc2lora:Doc2LoRATrainer"
+i_dlm = "forgekit.plugins.trainers.i_dlm:IDLMTrainer"
+
+[project.entry-points."forgekit.compressors"]
+onecompression = "forgekit.plugins.compressors.onecompression:OneCompressionCompressor"
+gptq = "forgekit.plugins.compressors.gptq:GPTQCompressor"
+awq = "forgekit.plugins.compressors.awq:AWQCompressor"
+hqq = "forgekit.plugins.compressors.hqq:HQQCompressor"
+bnb = "forgekit.plugins.compressors.bnb:BnBCompressor"
+aqlm = "forgekit.plugins.compressors.aqlm:AQLMCompressor"
+
+[project.entry-points."forgekit.evaluators"]
+lm_eval_harness = "forgekit.plugins.evaluators.lm_eval_harness:LMEvalHarnessEvaluator"
+perplexity = "forgekit.plugins.evaluators.perplexity:PerplexityEvaluator"
+
+[project.entry-points."forgekit.exporters"]
+gguf = "forgekit.plugins.exporters.gguf:GGUFExporter"
+vllm = "forgekit.plugins.exporters.vllm:VLLMExporter"
+mlx = "forgekit.plugins.exporters.mlx:MLXExporter"
+i_dlm_isd = "forgekit.plugins.exporters.i_dlm_isd:IDLMISDExporter"
+
+[tool.hatch.build.targets.wheel]
+packages = ["forgekit"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]  # allow en-dash / × / ≤ in prose docstrings
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

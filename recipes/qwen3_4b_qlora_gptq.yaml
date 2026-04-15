@@ -1,0 +1,39 @@
+name: qwen3-4b-qlora-gptq
+model: Qwen/Qwen3-4B
+
+data:
+  kind: hf_dataset
+  config:
+    path: tatsu-lab/alpaca
+    split: train
+
+trainer:
+  kind: qlora
+  config:
+    backend: unsloth
+    lr: 2.0e-4
+    micro_batch: 2
+    grad_accum: 4
+    steps: 200
+    seq_len: 2048
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.0
+
+compressors:
+  - kind: gptq
+    config:
+      bits: 4
+      group_size: 128
+      desc_act: false
+
+evaluator:
+  kind: perplexity
+  config:
+    dataset: wikitext2
+    seq_len: 2048
+
+exporter:
+  kind: gguf
+  config:
+    quant: q4_k_m
