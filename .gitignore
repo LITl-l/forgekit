@@ -28,8 +28,7 @@ htmlcov/
 *.swp
 *.swo
 
-# uv
-uv.lock
+# uv — uv.lock is committed (conventional for applications).
 
 # forgekit artifacts
 outputs/
