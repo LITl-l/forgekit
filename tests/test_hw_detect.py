@@ -10,14 +10,20 @@ import pytest
 from forgekit.hw import detect as detect_mod
 
 
-def _install_fake_torch(monkeypatch: pytest.MonkeyPatch, cc: tuple[int, int], vram_gb: float = 24.0) -> None:
+def _install_fake_torch(
+    monkeypatch: pytest.MonkeyPatch,
+    cc: tuple[int, int] | None,
+    vram_gb: float = 24.0,
+    cuda_available: bool = True,
+) -> None:
     class _FakeCuda:
         @staticmethod
         def is_available() -> bool:
-            return True
+            return cuda_available
 
         @staticmethod
         def get_device_capability(_idx: int = 0) -> tuple[int, int]:
+            assert cc is not None
             return cc
 
         @staticmethod
@@ -71,3 +77,45 @@ def test_no_torch_returns_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     importlib.reload(detect_mod)
     profile = detect_mod.detect()
     assert profile.arch == "unknown"
+
+
+def test_diagnose_ok_on_known_arch(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch(monkeypatch, (12, 1), vram_gb=128.0)
+    diag = detect_mod.diagnose()
+    assert diag.status is detect_mod.DetectionStatus.OK
+    assert diag.profile.arch == "gb10"
+    assert diag.detail == ""
+
+
+def test_diagnose_torch_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def _blocked_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("torch blocked for test")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("builtins.__import__", _blocked_import)
+    importlib.reload(detect_mod)
+    diag = detect_mod.diagnose()
+    assert diag.status is detect_mod.DetectionStatus.TORCH_MISSING
+    assert diag.profile.arch == "unknown"
+    assert "torch" in diag.detail.lower()
+
+
+def test_diagnose_cuda_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch(monkeypatch, cc=None, cuda_available=False)
+    diag = detect_mod.diagnose()
+    assert diag.status is detect_mod.DetectionStatus.CUDA_UNAVAILABLE
+    assert diag.profile.arch == "unknown"
+
+
+def test_diagnose_unrecognized_cc(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_torch(monkeypatch, (9, 0), vram_gb=80.0)
+    diag = detect_mod.diagnose()
+    assert diag.status is detect_mod.DetectionStatus.UNRECOGNIZED_CC
+    assert diag.profile.arch == "unknown"
+    assert "sm_90" in diag.detail

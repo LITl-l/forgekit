@@ -45,6 +45,23 @@ _OPTIONAL_EXTRAS: dict[str, str] = {
 
 _I_DLM_PLUGIN_NAMES = {"i_dlm", "i_dlm_isd"}
 
+# Actionable hints keyed by detect.DetectionStatus. Kept as plain strings so
+# the module stays importable on CPU-only hosts where torch is absent.
+_DETECT_HINTS: dict[hw_detect.DetectionStatus, str] = {
+    hw_detect.DetectionStatus.TORCH_MISSING: (
+        "install a torch build for your hardware, e.g. `uv pip install torch` "
+        "(GB10 / sm_121 needs the NVIDIA-provided nightly / preview wheel)"
+    ),
+    hw_detect.DetectionStatus.CUDA_UNAVAILABLE: (
+        "check the NVIDIA driver and `CUDA_VISIBLE_DEVICES`; run "
+        "`python -c 'import torch; print(torch.version.cuda, torch.cuda.device_count())'`"
+    ),
+    hw_detect.DetectionStatus.UNRECOGNIZED_CC: (
+        "add the compute capability to `_CC_TO_ARCH` in forgekit/hw/detect.py "
+        "(or open an issue with the CC tuple)"
+    ),
+}
+
 
 @app.command()
 def version() -> None:
@@ -158,11 +175,17 @@ def list_plugins_cmd() -> None:
 @app.command()
 def doctor() -> None:
     """Report detected hardware and which optional extras are importable."""
-    hw = hw_detect.detect()
+    diag = hw_detect.diagnose()
+    hw = diag.profile
     console.print(f"[bold]forgekit[/] v{__version__}")
     console.print(f"arch:      {hw.arch}")
     console.print(f"vram:      {hw.vram_gb:.1f} GB")
     console.print(f"unified:   {hw.unified_memory}")
+    if diag.status is not hw_detect.DetectionStatus.OK:
+        console.print(f"[yellow]detect:[/]    {diag.status.value} — {diag.detail}")
+        hint = _DETECT_HINTS.get(diag.status)
+        if hint:
+            console.print(f"[dim]hint:[/]      {hint}")
     console.print()
 
     table = Table(title="optional extras")
