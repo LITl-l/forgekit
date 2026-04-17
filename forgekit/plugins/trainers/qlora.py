@@ -18,11 +18,40 @@ Backend = Literal["unsloth", "trl", "auto"]
 
 
 class QLoRADataset(BaseModel):
-    """Inline dataset reference for v0 (data stage is a no-op in the scaffold)."""
+    """Inline dataset reference for v0 (data stage is a no-op in the scaffold).
+
+    Three loading shapes are supported, in priority order:
+
+    1. ``path`` points at a directory containing ``dataset_info.json`` — loaded
+       via ``datasets.load_from_disk`` (i.e. a dataset previously produced by
+       ``Dataset.save_to_disk``).
+    2. ``path`` + optional ``data_files`` — forwarded to ``load_dataset``. Use
+       this for HF Hub ids, builder names (``json`` / ``parquet`` / ``csv`` /
+       ``text``), or local files whose extension HF can sniff.
+    3. ``path`` alone as a bare local file — ``load_dataset(path)`` sniffs the
+       extension (``.jsonl`` → json loader, etc.).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str = Field(description="HF dataset path, e.g. 'tatsu-lab/alpaca'.")
+    path: str = Field(
+        description=(
+            "HF dataset id ('tatsu-lab/alpaca'), HF builder name ('json'), "
+            "or a local file / directory path."
+        )
+    )
+    name: str | None = Field(
+        default=None,
+        description="HF config name, e.g. 'wikitext-2-raw-v1'.",
+    )
+    data_files: str | list[str] | dict[str, str | list[str]] | None = Field(
+        default=None,
+        description=(
+            "Local files to load. Accepts a single path, a list of paths / "
+            "globs, or a split→paths mapping. Ignored when path is a "
+            "save_to_disk directory."
+        ),
+    )
     split: str = "train"
     text_column: str = "text"
     max_samples: int | None = None
@@ -98,14 +127,27 @@ class QLoRATrainer:
 
 def _load_dataset(cfg: QLoRAConfig) -> Any:
     """Lazy HF `datasets` loader. Returns a `Dataset` with `cfg.dataset.text_column`."""
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
 
-    ds = load_dataset(cfg.dataset.path, split=cfg.dataset.split)
-    if cfg.dataset.max_samples is not None:
-        ds = ds.select(range(min(cfg.dataset.max_samples, len(ds))))
-    if cfg.dataset.text_column not in ds.column_names:
+    spec = cfg.dataset
+    local_path = Path(spec.path)
+    if local_path.is_dir() and (local_path / "dataset_info.json").exists():
+        ds = load_from_disk(str(local_path))
+        if hasattr(ds, "keys") and spec.split in ds:
+            ds = ds[spec.split]
+    else:
+        kwargs: dict[str, Any] = {"split": spec.split}
+        if spec.name is not None:
+            kwargs["name"] = spec.name
+        if spec.data_files is not None:
+            kwargs["data_files"] = spec.data_files
+        ds = load_dataset(spec.path, **kwargs)
+
+    if spec.max_samples is not None:
+        ds = ds.select(range(min(spec.max_samples, len(ds))))
+    if spec.text_column not in ds.column_names:
         raise ValueError(
-            f"qlora: text_column {cfg.dataset.text_column!r} not in dataset columns "
+            f"qlora: text_column {spec.text_column!r} not in dataset columns "
             f"{ds.column_names}"
         )
     return ds
