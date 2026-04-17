@@ -1,0 +1,63 @@
+name: gemma4-e4b-qlora-awq-vllm
+model: google/gemma-4-E4B-it  # 4B-class instruction-tuned; fits QLoRA on 16–24 GB
+
+# Top-level `data:` is a no-op stub in v0 (see cli.py:118-122).
+# Real dataset configuration lives inside trainer.config.dataset.
+data:
+  kind: hf_dataset
+  config: {}
+
+trainer:
+  kind: qlora
+  config:
+    backend: unsloth  # fall back to `trl` if unsloth lacks Gemma 4 arch support
+    # --- Local dataset examples (pick one, delete the others) ---
+    # 1) Single local file (HF sniffs .jsonl / .json / .parquet / .csv / .txt):
+    dataset:
+      path: ./data/alpaca_local.jsonl
+      text_column: text
+    # 2) Multiple local parquet files via HF's json/parquet builder:
+    # dataset:
+    #   path: parquet
+    #   data_files: ["./data/train-000.parquet", "./data/train-001.parquet"]
+    #   text_column: text
+    # 3) A dataset saved with Dataset.save_to_disk (auto-detected):
+    # dataset:
+    #   path: ./data/alpaca_arrow_dir
+    #   text_column: text
+    # 4) HF Hub fallback (original default):
+    # dataset:
+    #   path: tatsu-lab/alpaca
+    #   text_column: text
+    lr: 2.0e-4
+    micro_batch_size: 2
+    grad_accum: 4
+    steps: 200
+    seq_len: 2048
+    lora_r: 16
+    lora_alpha: 32
+    lora_dropout: 0.0
+
+compressors:
+  - kind: awq
+    config:
+      bits: 4
+      group_size: 128
+      version: gemm
+
+evaluator:
+  kind: perplexity
+  config:
+    dataset: wikitext2
+    seq_len: 2048
+
+exporter:
+  kind: vllm
+  config:
+    output_subdir: vllm
+    merge_adapter: true   # merges the QLoRA adapter into base before AWQ sees it
+    dtype: auto
+    quantization: awq     # matches the compressor above
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    smoke_test: false     # set true to validate a 1-token generation end-to-end
