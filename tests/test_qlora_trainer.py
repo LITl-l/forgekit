@@ -15,6 +15,7 @@ from forgekit import registry
 from forgekit.plugins.trainers.qlora import (
     QLoRAConfig,
     QLoRATrainer,
+    _make_formatting_func,
     _resolve_backend,
 )
 
@@ -97,3 +98,103 @@ def test_resolve_backend_explicit_trl_missing(
     )
     with pytest.raises(RuntimeError, match=r"trl.*not installed"):
         _resolve_backend("trl")
+
+
+def test_dataset_prompt_without_completion_rejected() -> None:
+    with pytest.raises(ValidationError, match="set together"):
+        QLoRAConfig.model_validate(
+            {
+                "dataset": {
+                    "path": "any",
+                    "prompt_column": "question",
+                },
+            }
+        )
+
+
+def test_dataset_completion_without_prompt_rejected() -> None:
+    with pytest.raises(ValidationError, match="set together"):
+        QLoRAConfig.model_validate(
+            {
+                "dataset": {
+                    "path": "any",
+                    "completion_column": "answer",
+                },
+            }
+        )
+
+
+def test_dataset_prompt_completion_mode_detected() -> None:
+    cfg = QLoRAConfig.model_validate(
+        {
+            "dataset": {
+                "path": "any",
+                "prompt_column": "question",
+                "completion_column": "answer",
+            },
+        }
+    )
+    assert cfg.dataset.is_prompt_completion is True
+    assert cfg.dataset.prompt_column == "question"
+    assert cfg.dataset.completion_column == "answer"
+
+
+def test_dataset_text_column_mode_by_default() -> None:
+    cfg = QLoRAConfig.model_validate({"dataset": {"path": "any"}})
+    assert cfg.dataset.is_prompt_completion is False
+    assert cfg.dataset.text_column == "text"
+
+
+def test_formatting_func_none_in_text_column_mode() -> None:
+    cfg = QLoRAConfig.model_validate({"dataset": {"path": "any"}})
+    assert _make_formatting_func(cfg, tokenizer=object()) is None
+
+
+class _FakeTokenizer:
+    """Minimal stand-in for an HF tokenizer with a chat template."""
+
+    chat_template = "fake"
+
+    def apply_chat_template(
+        self, messages: list[dict[str, str]], *, tokenize: bool = False
+    ) -> str:
+        assert tokenize is False
+        parts = [f"[{m['role']}]{m['content']}" for m in messages]
+        return "".join(parts)
+
+
+class _NoTemplateTokenizer:
+    """Tokenizer that lacks a chat_template — represents base-model checkpoints."""
+
+    chat_template = None
+
+
+def test_formatting_func_uses_chat_template_when_present() -> None:
+    cfg = QLoRAConfig.model_validate(
+        {
+            "dataset": {
+                "path": "any",
+                "prompt_column": "q",
+                "completion_column": "a",
+            },
+        }
+    )
+    fmt = _make_formatting_func(cfg, _FakeTokenizer())
+    assert fmt is not None
+    out = fmt({"q": "hi", "a": "bye"})
+    assert out == "[user]hi[assistant]bye"
+
+
+def test_formatting_func_falls_back_when_no_template() -> None:
+    cfg = QLoRAConfig.model_validate(
+        {
+            "dataset": {
+                "path": "any",
+                "prompt_column": "q",
+                "completion_column": "a",
+            },
+        }
+    )
+    fmt = _make_formatting_func(cfg, _NoTemplateTokenizer())
+    assert fmt is not None
+    assert fmt({"q": "hi", "a": "bye"}) == "hi\n\nbye"
