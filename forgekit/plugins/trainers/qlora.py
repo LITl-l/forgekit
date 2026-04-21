@@ -7,10 +7,11 @@ Reference: Dettmers et al. 2023, https://arxiv.org/abs/2305.14314.
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forgekit.stages import StageContext
 
@@ -30,6 +31,15 @@ class QLoRADataset(BaseModel):
        ``text``), or local files whose extension HF can sniff.
     3. ``path`` alone as a bare local file — ``load_dataset(path)`` sniffs the
        extension (``.jsonl`` → json loader, etc.).
+
+    Two column-mapping modes are mutually exclusive:
+
+    * **Single-column** (default): ``text_column`` names the column that
+      already contains the full training string.
+    * **Prompt/completion**: set both ``prompt_column`` and ``completion_column``
+      to train on a (prompt, completion) pair. The trainer fuses them using
+      the tokenizer's chat template when available (e.g. Gemma's
+      ``<start_of_turn>user…<end_of_turn>``), else a plain ``"\\n\\n"`` join.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -54,7 +64,34 @@ class QLoRADataset(BaseModel):
     )
     split: str = "train"
     text_column: str = "text"
+    prompt_column: str | None = Field(
+        default=None,
+        description=(
+            "Column holding the user/instruction side of a pair. "
+            "Must be set together with completion_column; mutually exclusive "
+            "with text_column mode."
+        ),
+    )
+    completion_column: str | None = Field(
+        default=None,
+        description="Column holding the assistant/target side of a pair.",
+    )
     max_samples: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_column_mode(self) -> Self:
+        has_prompt = self.prompt_column is not None
+        has_completion = self.completion_column is not None
+        if has_prompt != has_completion:
+            raise ValueError(
+                "qlora.dataset: prompt_column and completion_column must be "
+                "set together, or neither (single-column text_column mode)."
+            )
+        return self
+
+    @property
+    def is_prompt_completion(self) -> bool:
+        return self.prompt_column is not None and self.completion_column is not None
 
 
 class QLoRAConfig(BaseModel):
@@ -145,12 +182,65 @@ def _load_dataset(cfg: QLoRAConfig) -> Any:
 
     if spec.max_samples is not None:
         ds = ds.select(range(min(spec.max_samples, len(ds))))
-    if spec.text_column not in ds.column_names:
+
+    if spec.is_prompt_completion:
+        # Validator guarantees both are non-None in prompt/completion mode.
+        assert spec.prompt_column is not None
+        assert spec.completion_column is not None
+        required: set[str] = {spec.prompt_column, spec.completion_column}
+        missing = required - set(ds.column_names)
+        if missing:
+            raise ValueError(
+                f"qlora: columns {sorted(missing)!r} not in dataset columns "
+                f"{ds.column_names}"
+            )
+    elif spec.text_column not in ds.column_names:
         raise ValueError(
             f"qlora: text_column {spec.text_column!r} not in dataset columns "
             f"{ds.column_names}"
         )
     return ds
+
+
+def _make_formatting_func(
+    cfg: QLoRAConfig, tokenizer: Any
+) -> Callable[[dict[str, Any]], str] | None:
+    """Build a per-example formatter for prompt/completion mode.
+
+    Returns None when in single-column (text_column) mode, signalling to the
+    caller that SFTTrainer should use ``dataset_text_field`` instead.
+
+    When in prompt/completion mode, prefers the tokenizer's own
+    ``apply_chat_template`` (model-specific, correct for IT checkpoints) and
+    falls back to a plain ``"\\n\\n"`` join for base-model tokenizers that
+    lack a chat template.
+    """
+    spec = cfg.dataset
+    if not spec.is_prompt_completion:
+        return None
+
+    # Validator guarantees both column names are non-None in prompt/completion mode.
+    assert spec.prompt_column is not None
+    assert spec.completion_column is not None
+    prompt_col: str = spec.prompt_column
+    completion_col: str = spec.completion_column
+    has_template = getattr(tokenizer, "chat_template", None) is not None
+
+    def _format(example: dict[str, Any]) -> str:
+        prompt = str(example[prompt_col])
+        completion = str(example[completion_col])
+        if has_template:
+            templated = tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": completion},
+                ],
+                tokenize=False,
+            )
+            return str(templated)
+        return f"{prompt}\n\n{completion}"
+
+    return _format
 
 
 def _train_unsloth(
@@ -183,11 +273,17 @@ def _train_unsloth(
     from transformers import TrainingArguments
     from trl import SFTTrainer
 
+    formatting_func = _make_formatting_func(cfg, tokenizer)
+    sft_kwargs: dict[str, Any] = {}
+    if formatting_func is not None:
+        sft_kwargs["formatting_func"] = formatting_func
+    else:
+        sft_kwargs["dataset_text_field"] = cfg.dataset.text_column
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=ds,
-        dataset_text_field=cfg.dataset.text_column,
         max_seq_length=seq_len,
         args=TrainingArguments(
             output_dir=str(out_dir / "checkpoints"),
@@ -202,6 +298,7 @@ def _train_unsloth(
             bf16=True,
             report_to=[],
         ),
+        **sft_kwargs,
     )
     trainer.train()
     model.save_pretrained(str(out_dir))
@@ -260,11 +357,17 @@ def _train_trl(
 
     ds = _load_dataset(cfg)
 
+    formatting_func = _make_formatting_func(cfg, tokenizer)
+    sft_kwargs: dict[str, Any] = {}
+    if formatting_func is not None:
+        sft_kwargs["formatting_func"] = formatting_func
+    else:
+        sft_kwargs["dataset_text_field"] = cfg.dataset.text_column
+
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=ds,
-        dataset_text_field=cfg.dataset.text_column,
         max_seq_length=seq_len,
         args=TrainingArguments(
             output_dir=str(out_dir / "checkpoints"),
@@ -279,6 +382,7 @@ def _train_trl(
             bf16=True,
             report_to=[],
         ),
+        **sft_kwargs,
     )
     trainer.train()
     model.save_pretrained(str(out_dir))
