@@ -24,8 +24,9 @@ def test_config_defaults() -> None:
     cfg = AWQConfig.model_validate({})
     assert cfg.bits == 4
     assert cfg.group_size == 128
-    assert cfg.zero_point is True
-    assert cfg.version == "gemm"
+    assert cfg.symmetric is False
+    assert cfg.scheme == "W4A16_ASYM"
+    assert cfg.ignore == ["lm_head"]
     assert cfg.calibration.path == "mit-han-lab/pile-val-backup"
     assert cfg.calibration.num_samples == 128
     assert cfg.output_subdir == "awq"
@@ -41,15 +42,20 @@ def test_config_rejects_invalid_bits() -> None:
         AWQConfig.model_validate({"bits": 8})
 
 
-def test_config_rejects_invalid_version() -> None:
-    with pytest.raises(ValidationError):
-        AWQConfig.model_validate({"version": "bogus"})
+def test_symmetric_selects_scheme() -> None:
+    assert AWQConfig.model_validate({"symmetric": True}).scheme == "W4A16"
+    assert AWQConfig.model_validate({"symmetric": False}).scheme == "W4A16_ASYM"
 
 
-def test_config_accepts_valid_versions() -> None:
-    for v in ("gemm", "gemv", "gemv_fast"):
-        cfg = AWQConfig.model_validate({"version": v})
-        assert cfg.version == v
+def test_config_rejects_removed_autoawq_fields() -> None:
+    """`version` and `zero_point` were AutoAWQ kernel knobs with no successor.
+
+    compressed-tensors defers kernel choice to the serving runtime, so these
+    must be rejected rather than silently ignored.
+    """
+    for dead in ("version", "zero_point"):
+        with pytest.raises(ValidationError):
+            AWQConfig.model_validate({dead: "gemm"})
 
 
 def test_require_backend_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,7 +107,7 @@ def test_compress_invalid_config_raises_before_backend_check(
         model_path="dummy/model",
         work_dir=tmp_path,
         hw=unknown_profile(),
-        stage_config={"version": "bogus"},
+        stage_config={"bits": 8},
     )
     with pytest.raises(ValidationError):
         AWQCompressor().compress(ctx)

@@ -15,7 +15,7 @@ from forgekit import registry
 from forgekit.plugins.trainers.qlora import (
     QLoRAConfig,
     QLoRATrainer,
-    _make_formatting_func,
+    _prepare_text_column,
     _resolve_backend,
 )
 
@@ -145,9 +145,14 @@ def test_dataset_text_column_mode_by_default() -> None:
     assert cfg.dataset.text_column == "text"
 
 
-def test_formatting_func_none_in_text_column_mode() -> None:
-    cfg = QLoRAConfig.model_validate({"dataset": {"path": "any"}})
-    assert _make_formatting_func(cfg, tokenizer=object()) is None
+class _FakeDataset:
+    """Minimal stand-in for a HF Dataset — only `map` is exercised here."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def map(self, fn: Any) -> _FakeDataset:
+        return _FakeDataset([{**row, **fn(row)} for row in self.rows])
 
 
 class _FakeTokenizer:
@@ -159,8 +164,7 @@ class _FakeTokenizer:
         self, messages: list[dict[str, str]], *, tokenize: bool = False
     ) -> str:
         assert tokenize is False
-        parts = [f"[{m['role']}]{m['content']}" for m in messages]
-        return "".join(parts)
+        return "".join(f"[{m['role']}]{m['content']}" for m in messages)
 
 
 class _NoTemplateTokenizer:
@@ -169,32 +173,36 @@ class _NoTemplateTokenizer:
     chat_template = None
 
 
-def test_formatting_func_uses_chat_template_when_present() -> None:
-    cfg = QLoRAConfig.model_validate(
-        {
-            "dataset": {
-                "path": "any",
-                "prompt_column": "q",
-                "completion_column": "a",
-            },
-        }
+def _pc_config() -> QLoRAConfig:
+    return QLoRAConfig.model_validate(
+        {"dataset": {"path": "any", "prompt_column": "q", "completion_column": "a"}}
     )
-    fmt = _make_formatting_func(cfg, _FakeTokenizer())
-    assert fmt is not None
-    out = fmt({"q": "hi", "a": "bye"})
-    assert out == "[user]hi[assistant]bye"
 
 
-def test_formatting_func_falls_back_when_no_template() -> None:
-    cfg = QLoRAConfig.model_validate(
-        {
-            "dataset": {
-                "path": "any",
-                "prompt_column": "q",
-                "completion_column": "a",
-            },
-        }
-    )
-    fmt = _make_formatting_func(cfg, _NoTemplateTokenizer())
-    assert fmt is not None
-    assert fmt({"q": "hi", "a": "bye"}) == "hi\n\nbye"
+def test_text_column_mode_passes_dataset_through_untouched() -> None:
+    cfg = QLoRAConfig.model_validate({"dataset": {"path": "any"}})
+    ds = _FakeDataset([{"text": "hello"}])
+    out_ds, field = _prepare_text_column(ds, cfg, tokenizer=object())
+    assert out_ds is ds, "single-column mode must not copy the dataset"
+    assert field == "text"
+
+
+def test_prompt_completion_uses_chat_template_when_present() -> None:
+    ds = _FakeDataset([{"q": "hi", "a": "bye"}])
+    out_ds, field = _prepare_text_column(ds, _pc_config(), _FakeTokenizer())
+    assert field == "_forgekit_text"
+    assert out_ds.rows[0][field] == "[user]hi[assistant]bye"
+
+
+def test_prompt_completion_falls_back_when_no_template() -> None:
+    ds = _FakeDataset([{"q": "hi", "a": "bye"}])
+    out_ds, field = _prepare_text_column(ds, _pc_config(), _NoTemplateTokenizer())
+    assert out_ds.rows[0][field] == "hi\n\nbye"
+
+
+def test_fused_column_name_cannot_collide_with_source_columns() -> None:
+    """The fused column is deliberately not called "text"."""
+    ds = _FakeDataset([{"q": "hi", "a": "bye", "text": "pre-existing"}])
+    out_ds, field = _prepare_text_column(ds, _pc_config(), _FakeTokenizer())
+    assert field != "text"
+    assert out_ds.rows[0]["text"] == "pre-existing", "source column was clobbered"

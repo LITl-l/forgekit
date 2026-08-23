@@ -56,7 +56,7 @@ A plugin may be merged only if its upstream dependencies are:
 Non-commercial / no-derivatives licenses (e.g. CC BY-NC-ND, PHOTON) are
 rejected. If the upstream license is unclear, the plugin is gated behind an
 opt-in environment variable (see `FORGEKIT_ACCEPT_I_DLM_LICENSE` for the
-pattern) and must not ship in `[all]`.
+pattern) and must not be a dependency of any other extra.
 
 ## Version pinning
 

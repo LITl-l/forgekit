@@ -32,8 +32,9 @@ _OPTIONAL_EXTRAS: dict[str, str] = {
     "trl": "trl",
     "torchtune": "torchtune",
     "onecompression": "onecompression",
-    "auto-gptq": "auto_gptq",
-    "autoawq": "awq",
+    "auto-round": "auto_round",
+    "gptqmodel": "gptqmodel",
+    "llmcompressor": "llmcompressor",
     "hqq": "hqq",
     "bitsandbytes": "bitsandbytes",
     "aqlm": "aqlm",
@@ -52,13 +53,15 @@ _DETECT_HINTS: dict[hw_detect.DetectionStatus, str] = {
         "install a torch build for your hardware, e.g. `uv pip install torch` "
         "(GB10 / sm_121 needs the NVIDIA-provided nightly / preview wheel)"
     ),
-    hw_detect.DetectionStatus.CUDA_UNAVAILABLE: (
-        "check the NVIDIA driver and `CUDA_VISIBLE_DEVICES`; run "
-        "`python -c 'import torch; print(torch.version.cuda, torch.cuda.device_count())'`"
+    hw_detect.DetectionStatus.NO_ACCELERATOR: (
+        "check the driver and `CUDA_VISIBLE_DEVICES`; run "
+        "`python -c 'import torch; print(torch.version.cuda, torch.cuda.device_count())'`. "
+        "Training on CPU works but is impractically slow for anything but the smoke test."
     ),
-    hw_detect.DetectionStatus.UNRECOGNIZED_CC: (
-        "add the compute capability to `_CC_TO_ARCH` in forgekit/hw/detect.py "
-        "(or open an issue with the CC tuple)"
+    hw_detect.DetectionStatus.UNNAMED_ARCH: (
+        "no action needed — VRAM and dtype support were measured from the device. "
+        "Open a PR adding the compute capability to `_CC_TO_ARCH` if you want a "
+        "friendlier label."
     ),
 }
 
@@ -179,8 +182,26 @@ def doctor() -> None:
     hw = diag.profile
     console.print(f"[bold]forgekit[/] v{__version__}")
     console.print(f"arch:      {hw.arch}")
-    console.print(f"vram:      {hw.vram_gb:.1f} GB")
+    console.print(f"backend:   {hw.backend}")
+    console.print(f"vram:      {hw.vram_gb:.1f} GB (usable ~{hw.usable_vram_gb:.1f} GB)")
     console.print(f"unified:   {hw.unified_memory}")
+
+    # Plugins branch on these, so `doctor` has to show them: a surprising
+    # training dtype or a missing fp4 row explains most "why is this slow /
+    # why did this fault" questions before they get asked.
+    dtypes = [
+        ("bf16", hw.supports_bf16),
+        ("fp8", hw.supports_fp8),
+        ("fp4", hw.supports_fp4),
+    ]
+    rendered = "  ".join(
+        f"[green]✓[/]{label}" if ok else f"[dim]✗{label}[/]" for label, ok in dtypes
+    )
+    console.print(f"dtypes:    {rendered}")
+    console.print(f"train as:  {hw.training_dtype}")
+    console.print(
+        f"suggests:  micro_batch={hw.suggested_micro_batch} seq_len={hw.suggested_seq_len}"
+    )
     if diag.status is not hw_detect.DetectionStatus.OK:
         console.print(f"[yellow]detect:[/]    {diag.status.value} — {diag.detail}")
         hint = _DETECT_HINTS.get(diag.status)

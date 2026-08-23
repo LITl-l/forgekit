@@ -10,7 +10,7 @@ data:
 trainer:
   kind: qlora
   config:
-    backend: unsloth  # fall back to `trl` if unsloth lacks Gemma 4 arch support
+    backend: auto  # unsloth if importable, else trl (unsloth cannot coexist with awq)
     # --- Local dataset examples (pick one, delete the others) ---
     # 1) Single local file (HF sniffs .jsonl / .json / .parquet / .csv / .txt):
     dataset:
@@ -43,7 +43,10 @@ compressors:
     config:
       bits: 4
       group_size: 128
-      version: gemm
+      # `version` (gemm/gemv) was an AutoAWQ kernel choice. compressed-tensors
+      # defers kernel selection to the serving runtime, so symmetry is the only
+      # knob left here.
+      symmetric: false
 
 evaluator:
   kind: perplexity

@@ -10,9 +10,10 @@ data:
 trainer:
   kind: doc2lora
   config:
-    hypernet_ckpt: SakanaAI/doc-to-lora
-    adapter_rank: 8
-    adapter_alpha: 16
+    documents: ["./example_docs/"]
+    hypernetwork_checkpoint: SakanaAI/doc-to-lora
+    lora_r: 8
+    lora_alpha: 16
 
 evaluator:
   kind: perplexity

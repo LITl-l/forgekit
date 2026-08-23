@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Research-incubator pipeline for local LLM development: data -> fine-tune -> compress -> eval -> serve."
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "forgekit contributors" }]
 keywords = ["llm", "fine-tuning", "quantization", "lora", "qlora", "gguf", "vllm"]
 classifiers = [
@@ -31,51 +31,81 @@ dependencies = [
 forgekit = "forgekit.cli:app"
 
 [project.optional-dependencies]
-# Plugin extras are intentionally empty in the scaffold PR. The follow-up
-# plugin PRs pin the concrete upstream (PyPI name and minimum version) when
-# they land the implementation. Until then, each extra is a named placeholder
-# so users and CI can refer to it without resolution breakage.
-unsloth = [
-    "unsloth>=2024.8",
-    "trl>=0.9,<0.12",
-    "transformers>=4.43,<5",
-    "datasets>=2.19,<3",
-    "peft>=0.11,<0.13",
-    "accelerate>=0.30,<1",
+# Every extra below installs something. An earlier revision left ten of them as
+# empty lists ("intentionally empty in the scaffold PR"), so `--extra awq`
+# silently installed nothing while `doctor` reported the backend missing
+# forever. The shared ML pins were also two major versions stale — `<5` on
+# transformers and `<0.12` on trl excluded every current release — which made
+# the extras that *were* populated resolve to a 2024-era stack.
+#
+# Shared runtime for anything that touches a HF model.
+hf = [
+    "transformers>=5.9,<5.15",
+    "datasets>=4.2,<5",
+    "accelerate>=1.14,<2",
+    "peft>=0.20,<0.21",
 ]
 trl = [
-    "trl>=0.9,<0.12",
-    "transformers>=4.43,<5",
-    "datasets>=2.19,<3",
-    "peft>=0.11,<0.13",
-    "accelerate>=0.30,<1",
-    "bitsandbytes>=0.43,<0.45",
+    "trl>=1.10,<2",
+    "bitsandbytes>=0.50,<0.51",
+    "forgekit[hf]",
 ]
-torchtune = []
-onecompression = []
-gptq = [
-    "auto-gptq>=0.7,<0.8",
-    "transformers>=4.43,<5",
-    "datasets>=2.19,<3",
-    "peft>=0.11,<0.13",
-    "accelerate>=0.30,<1",
-]
-awq = []
-hqq = []
-bnb = []
-aqlm = []
-doc2lora = []
-lm-eval = []
-gguf = []
-vllm = []
-mlx = []
-i-dlm = []
+torchtune = ["torchtune>=0.6,<0.7"]
+# NOTE: there is deliberately no `unsloth` or `vllm` extra, and no `all`.
+#
+# Both are supported by their plugins — `backend: unsloth` and the vllm
+# exporter work whenever the package is importable — but neither can share a
+# resolution with the mainstream stack:
+#
+#   unsloth  caps transformers<=5.5, datasets<4.4, trl<=0.24
+#   vllm     pins compressed-tensors==0.17.0 and protobuf<7, against
+#            llm-compressor's ==0.18.0 and gptqmodel's protobuf>=7.34
+#
+# Declaring them as conflicting extras is expressible but makes `uv lock`
+# fork combinatorially. They belong in their own environments instead:
+#
+#   uv venv .venv-unsloth && uv pip install --python .venv-unsloth 'unsloth>=2026.8' -e .
+#   uv venv .venv-serve   && uv pip install --python .venv-serve   'vllm>=0.27'
+#
+# See docs/compression_landscape.md for the full dependency findings.
+# Not published to PyPI. Install from source:
+#   uv pip install 'onecompression @ git+https://github.com/FujitsuResearch/OneCompression'
+onecompression = ["forgekit[hf]"]
+# gptqmodel replaces auto-gptq, archived 2025-04-11 and dropped by transformers.
+gptq = ["gptqmodel>=7.3,<8", "forgekit[hf]"]
+# llmcompressor replaces autoawq, deprecated and adopted by the vLLM project.
+awq = ["llmcompressor>=0.13,<0.13.1", "forgekit[hf]"]
+# AutoRound: signed-gradient rounding search. Best accuracy below 4 bits, and
+# the only backend here that can emit every downstream format.
+autoround = ["auto-round>=0.14,<0.15", "forgekit[hf]"]
+hqq = ["hqq>=0.2.8,<0.3", "forgekit[hf]"]
+bnb = ["bitsandbytes>=0.50,<0.51", "forgekit[hf]"]
+aqlm = ["aqlm>=1.1,<1.2", "forgekit[hf]"]
+doc2lora = ["forgekit[hf]"]
+lm-eval = ["lm-eval>=0.4.12,<0.5", "forgekit[hf]"]
+gguf = ["gguf>=0.19,<0.20", "llama-cpp-python>=0.3.35,<0.4"]
+mlx = ["mlx-lm>=0.31,<0.32"]
+i-dlm = ["forgekit[hf]"]
 dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest>=8.0",
     "pytest-mock>=3.12",
     "types-PyYAML",
+]
+
+[tool.uv]
+# Resolve only for platforms forgekit actually supports. Without this uv also
+# forks the resolution for win32 — where bitsandbytes, vllm, and unsloth have no
+# wheels anyway — which roughly triples resolution time for no benefit.
+#
+#   linux/aarch64 — GB10 (Grace ARM), the primary target
+#   linux/x86_64  — consumer and datacenter GPUs
+#   darwin        — Apple Silicon, for the mlx exporter
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'darwin'",
 ]
 
 [project.urls]
@@ -95,6 +125,7 @@ i_dlm = "forgekit.plugins.trainers.i_dlm:IDLMTrainer"
 [project.entry-points."forgekit.compressors"]
 onecompression = "forgekit.plugins.compressors.onecompression:OneCompressionCompressor"
 gptq = "forgekit.plugins.compressors.gptq:GPTQCompressor"
+autoround = "forgekit.plugins.compressors.autoround:AutoRoundCompressor"
 awq = "forgekit.plugins.compressors.awq:AWQCompressor"
 hqq = "forgekit.plugins.compressors.hqq:HQQCompressor"
 bnb = "forgekit.plugins.compressors.bnb:BnBCompressor"
@@ -129,4 +160,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+# Smoke tests are deselected by default: they need the ML extras and pull a
+# small model from HuggingFace. `just smoke` (or `-m smoke`) opts back in.
+addopts = "-ra -m 'not smoke'"
+markers = [
+    "smoke: end-to-end test that really executes a pipeline stage (needs ML extras + network)",
+]

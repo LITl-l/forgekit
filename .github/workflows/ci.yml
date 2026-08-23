@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The smoke job is the only thing that catches upstream API drift, and drift
+  # happens on upstream's schedule, not ours — so run it weekly regardless of
+  # whether anyone opened a PR.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -28,8 +34,14 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
 
+      # Fails if uv.lock has drifted from pyproject.toml. Without this a stale
+      # lock silently resolves different versions than a fresh checkout would,
+      # which makes every downstream failure ambiguous.
+      - name: Lockfile is current
+        run: uv lock --check
+
       - name: Install (dev extra only — no GPU deps on CI)
-        run: uv sync --extra dev
+        run: uv sync --locked --extra dev
 
       - name: Ruff
         run: uv run ruff check .
@@ -39,3 +51,29 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
+
+  smoke:
+    name: smoke (real execution, CPU)
+    # Skipped on ordinary PRs: installs a multi-hundred-MB ML stack. Runs on
+    # main, on the weekly schedule, and on demand.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Not --locked: the point of this job is to notice when a *current*
+      # upstream release breaks us, which a pinned resolution would hide.
+      - name: Install ML extras
+        run: uv sync --extra dev --extra trl --extra autoround --extra gptq
+
+      - name: Smoke (executes real pipeline stages)
+        run: uv run pytest -m smoke -v
