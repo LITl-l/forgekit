@@ -7,7 +7,6 @@ Reference: Dettmers et al. 2023, https://arxiv.org/abs/2305.14314.
 from __future__ import annotations
 
 import importlib.util
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
@@ -16,6 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from forgekit.stages import StageContext
 
 Backend = Literal["unsloth", "trl", "auto"]
+
+# Column name used when fusing a (prompt, completion) pair into one training
+# string. Deliberately not "text" so it cannot collide with a column the source
+# dataset already has.
+_FUSED_TEXT_FIELD = "_forgekit_text"
 
 
 class QLoRADataset(BaseModel):
@@ -202,22 +206,23 @@ def _load_dataset(cfg: QLoRAConfig) -> Any:
     return ds
 
 
-def _make_formatting_func(
-    cfg: QLoRAConfig, tokenizer: Any
-) -> Callable[[dict[str, Any]], str] | None:
-    """Build a per-example formatter for prompt/completion mode.
+def _prepare_text_column(ds: Any, cfg: QLoRAConfig, tokenizer: Any) -> tuple[Any, str]:
+    """Materialise the training string as a real dataset column.
 
-    Returns None when in single-column (text_column) mode, signalling to the
-    caller that SFTTrainer should use ``dataset_text_field`` instead.
+    Returns ``(dataset, column_name)`` for ``SFTConfig.dataset_text_field``.
 
-    When in prompt/completion mode, prefers the tokenizer's own
-    ``apply_chat_template`` (model-specific, correct for IT checkpoints) and
-    falls back to a plain ``"\\n\\n"`` join for base-model tokenizers that
-    lack a chat template.
+    In single-column mode this is a no-op passthrough. In prompt/completion mode
+    the pair is fused here rather than via ``SFTTrainer(formatting_func=...)``:
+    doing it with ``ds.map`` keeps the behaviour identical across TRL versions
+    and lets the result be inspected, which a callback cannot.
+
+    Prefers the tokenizer's own ``apply_chat_template`` (model-specific, correct
+    for IT checkpoints) and falls back to a plain ``"\\n\\n"`` join for
+    base-model tokenizers that lack a chat template.
     """
     spec = cfg.dataset
     if not spec.is_prompt_completion:
-        return None
+        return ds, spec.text_column
 
     # Validator guarantees both column names are non-None in prompt/completion mode.
     assert spec.prompt_column is not None
@@ -226,7 +231,7 @@ def _make_formatting_func(
     completion_col: str = spec.completion_column
     has_template = getattr(tokenizer, "chat_template", None) is not None
 
-    def _format(example: dict[str, Any]) -> str:
+    def _format(example: dict[str, Any]) -> dict[str, str]:
         prompt = str(example[prompt_col])
         completion = str(example[completion_col])
         if has_template:
@@ -237,10 +242,62 @@ def _make_formatting_func(
                 ],
                 tokenize=False,
             )
-            return str(templated)
-        return f"{prompt}\n\n{completion}"
+            return {_FUSED_TEXT_FIELD: str(templated)}
+        return {_FUSED_TEXT_FIELD: f"{prompt}\n\n{completion}"}
 
-    return _format
+    return ds.map(_format), _FUSED_TEXT_FIELD
+
+
+def _sft_config(
+    cfg: QLoRAConfig,
+    ctx: StageContext,
+    out_dir: Path,
+    micro_bsz: int,
+    seq_len: int,
+    text_field: str,
+) -> Any:
+    """Build the TRL training config.
+
+    Two things here are deliberate:
+
+    * ``SFTConfig`` replaces ``TrainingArguments``. TRL 1.x moved
+      ``max_seq_length`` onto the config as ``max_length`` and dropped the
+      trainer-level ``tokenizer=`` and ``dataset_text_field=`` arguments.
+    * The training dtype comes from the detected device, not a hardcoded
+      ``bf16=True``. Pre-Ampere CUDA cards, most ROCm builds, and CPU runs do
+      not support bf16 and will fault or silently degrade if it is forced.
+    """
+    import inspect
+
+    from trl import SFTConfig
+
+    dtype = ctx.hw.training_dtype
+    kwargs: dict[str, Any] = {
+        "output_dir": str(out_dir / "checkpoints"),
+        "per_device_train_batch_size": micro_bsz,
+        "gradient_accumulation_steps": cfg.grad_accum,
+        "max_steps": cfg.steps,
+        "learning_rate": cfg.lr,
+        "warmup_steps": cfg.warmup_steps,
+        "weight_decay": cfg.weight_decay,
+        "logging_steps": 10,
+        "seed": cfg.seed,
+        "bf16": dtype == "bf16",
+        "fp16": dtype == "fp16",
+        "report_to": [],
+    }
+
+    # TRL renamed the sequence-length field (`max_seq_length` → `max_length`)
+    # in 1.x and moved `dataset_text_field` onto the config. The `unsloth`
+    # backend still pins a 0.x TRL — unsloth caps trl<=0.24 while everything
+    # else needs >=1.10 — so both generations have to work. Detect the field
+    # names rather than assuming either one.
+    params = inspect.signature(SFTConfig.__init__).parameters
+    kwargs["max_length" if "max_length" in params else "max_seq_length"] = seq_len
+    if "dataset_text_field" in params:
+        kwargs["dataset_text_field"] = text_field
+
+    return SFTConfig(**kwargs)
 
 
 def _train_unsloth(
@@ -269,36 +326,14 @@ def _train_unsloth(
     )
 
     ds = _load_dataset(cfg)
+    ds, text_field = _prepare_text_column(ds, cfg, tokenizer)
 
-    from transformers import TrainingArguments
     from trl import SFTTrainer
-
-    formatting_func = _make_formatting_func(cfg, tokenizer)
-    sft_kwargs: dict[str, Any] = {}
-    if formatting_func is not None:
-        sft_kwargs["formatting_func"] = formatting_func
-    else:
-        sft_kwargs["dataset_text_field"] = cfg.dataset.text_column
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=ds,
-        max_seq_length=seq_len,
-        args=TrainingArguments(
-            output_dir=str(out_dir / "checkpoints"),
-            per_device_train_batch_size=micro_bsz,
-            gradient_accumulation_steps=cfg.grad_accum,
-            max_steps=cfg.steps,
-            learning_rate=cfg.lr,
-            warmup_steps=cfg.warmup_steps,
-            weight_decay=cfg.weight_decay,
-            logging_steps=10,
-            seed=cfg.seed,
-            bf16=True,
-            report_to=[],
-        ),
-        **sft_kwargs,
+        args=_sft_config(cfg, ctx, out_dir, micro_bsz, seq_len, text_field),
     )
     trainer.train()
     model.save_pretrained(str(out_dir))
@@ -314,24 +349,22 @@ def _train_trl(
     seq_len: int,
 ) -> Path:
     import torch
-    from peft import (
-        LoraConfig,
-        get_peft_model,
-        prepare_model_for_kbit_training,
-    )
+    from peft import LoraConfig, prepare_model_for_kbit_training
     from transformers import (
         AutoModelForCausalLM,
         AutoTokenizer,
         BitsAndBytesConfig,
-        TrainingArguments,
     )
     from trl import SFTTrainer
 
+    # Match the NF4 compute dtype to what the device actually supports, so a
+    # pre-Ampere or ROCm card falls back to fp16 instead of faulting on bf16.
+    compute_dtype = torch.bfloat16 if ctx.hw.supports_bf16 else torch.float16
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype,
     )
     model = AutoModelForCausalLM.from_pretrained(
         ctx.model_path,
@@ -353,38 +386,19 @@ def _train_trl(
         target_modules=cfg.target_modules
         or ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
-    model = get_peft_model(model, lora)
-
     ds = _load_dataset(cfg)
+    ds, text_field = _prepare_text_column(ds, cfg, tokenizer)
 
-    formatting_func = _make_formatting_func(cfg, tokenizer)
-    sft_kwargs: dict[str, Any] = {}
-    if formatting_func is not None:
-        sft_kwargs["formatting_func"] = formatting_func
-    else:
-        sft_kwargs["dataset_text_field"] = cfg.dataset.text_column
-
+    # TRL applies the adapter itself when handed a `peft_config`, so the model
+    # is passed in unwrapped. Calling `get_peft_model` here as well would wrap
+    # it twice.
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=ds,
-        max_seq_length=seq_len,
-        args=TrainingArguments(
-            output_dir=str(out_dir / "checkpoints"),
-            per_device_train_batch_size=micro_bsz,
-            gradient_accumulation_steps=cfg.grad_accum,
-            max_steps=cfg.steps,
-            learning_rate=cfg.lr,
-            warmup_steps=cfg.warmup_steps,
-            weight_decay=cfg.weight_decay,
-            logging_steps=10,
-            seed=cfg.seed,
-            bf16=True,
-            report_to=[],
-        ),
-        **sft_kwargs,
+        peft_config=lora,
+        args=_sft_config(cfg, ctx, out_dir, micro_bsz, seq_len, text_field),
     )
     trainer.train()
-    model.save_pretrained(str(out_dir))
+    trainer.save_model(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
     return out_dir

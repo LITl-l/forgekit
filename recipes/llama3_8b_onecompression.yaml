@@ -13,7 +13,12 @@ data:
 trainer:
   kind: qlora
   config:
-    backend: unsloth
+    backend: auto  # unsloth if importable, else trl
+    dataset:
+      path: allenai/c4
+      name: en
+      text_column: text
+      max_samples: 20000
     lr: 1.0e-4
     steps: 500
     seq_len: 4096
@@ -22,10 +27,11 @@ trainer:
 compressors:
   - kind: onecompression
     config:
-      mode: mixed_precision
-      autobit: true
+      # AutoBit assigns per-layer bit-widths under a memory budget.
+      mode: autobit
       target_avg_bits: 3.5
-      calibration_samples: 128
+      calibration:
+        num_samples: 128
 
 evaluator:
   kind: lm_eval_harness
@@ -36,5 +42,6 @@ evaluator:
 exporter:
   kind: vllm
   config:
-    attention_backend: triattention
-    kv_cache_dtype: fp8
+    dtype: auto
+    quantization: auto
+    gpu_memory_utilization: 0.9

@@ -10,9 +10,13 @@ data:
 trainer:
   kind: qlora
   config:
-    backend: unsloth
+    backend: auto  # unsloth if importable, else trl
+    dataset:
+      path: tatsu-lab/alpaca
+      prompt_column: instruction
+      completion_column: output
     lr: 2.0e-4
-    micro_batch: 2
+    micro_batch_size: 2
     grad_accum: 4
     steps: 200
     seq_len: 2048

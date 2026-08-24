@@ -1,12 +1,44 @@
-"""Perplexity evaluator — sliding-window NLL over a held-out corpus.
+"""Perplexity evaluator — sliding-window NLL with a bootstrap confidence interval.
 
 Default corpus is wikitext-2 (``test`` split). The scoring loop mirrors the
 HuggingFace reference (`transformers` docs: "Perplexity of fixed-length models")
 — concatenate the text, slide windows of ``seq_len`` with step ``stride``,
 mask out overlap tokens from the loss, and report ``exp(mean window NLL)``.
 
-Backends: ``transformers`` + ``datasets`` + ``torch``. All of these are pulled
-in by the ``[trl]`` and ``[gptq]`` extras, so most users already have them.
+Read this before trusting the number
+------------------------------------
+Perplexity is a *fluency* measure. It is a poor proxy for the thing most
+forgekit users actually care about after compressing a model — whether it still
+reasons correctly — and it is systematically most misleading in exactly the
+situation forgekit creates.
+
+Empirically, aggressive PTQ degrades reasoning accuracy while *lengthening*
+chains of thought, with reported Spearman ρ ≈ -0.73 between accuracy loss and
+CoT length growth; quantized models frequently reach the right answer mid-trace
+and then talk themselves out of it. None of that moves perplexity much. A
+compressed model can hold its perplexity to three decimal places and still lose
+several points of task accuracy.
+
+So: use this evaluator as a cheap regression signal — it will catch a genuinely
+broken quantization run — and use the ``lm_eval_harness`` evaluator for any
+claim about capability.
+
+Two numbers, not one
+--------------------
+This evaluator reports a bootstrap confidence interval alongside the point
+estimate, because a bare perplexity figure invites comparisons it cannot
+support. Resampling is over evaluation *windows* (the independent units the
+loop actually produces), token-weighted so that a short trailing window does not
+count the same as a full one.
+
+The interval is a percentile bootstrap on mean NLL, exponentiated at the
+endpoints. ``exp`` is monotonic, so the transformed endpoints remain a valid
+interval for perplexity — which is why this is done here rather than
+bootstrapping perplexity directly. A percentile bootstrap is used in preference
+to a CLT/normal interval because window counts are routinely in the tens, where
+normal-approximation intervals are known to be unreliable.
+
+Backends: ``transformers`` + ``datasets`` + ``torch``.
 """
 
 from __future__ import annotations
@@ -14,9 +46,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
-from typing import Any, ClassVar
+import random
+from typing import Any, ClassVar, Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from forgekit.stages import StageContext
 
@@ -27,6 +60,10 @@ _DATASET_ALIASES: dict[str, tuple[str, str | None, str, str]] = {
     "ptb": ("ptb_text_only", None, "test", "sentence"),
     "c4": ("allenai/c4", "en", "validation", "text"),
 }
+
+# Below this many windows a resampled interval is too coarse to mean anything;
+# report the point estimate and say why rather than printing a fake interval.
+_MIN_WINDOWS_FOR_CI = 5
 
 
 class PerplexityConfig(BaseModel):
@@ -44,10 +81,22 @@ class PerplexityConfig(BaseModel):
     max_samples: int | None = None
     device: str | None = None
     merge_adapter: bool = True
+    bootstrap_resamples: int = Field(
+        default=1000,
+        ge=0,
+        description="Bootstrap iterations for the CI. 0 disables the interval.",
+    )
+    ci_level: float = Field(
+        default=0.95,
+        gt=0.0,
+        lt=1.0,
+        description="Confidence level for the reported interval.",
+    )
+    seed: int = Field(default=0, description="Seed for bootstrap resampling.")
     output_subdir: str = "perplexity"
 
     @model_validator(mode="after")
-    def _validate_dataset(self) -> PerplexityConfig:
+    def _validate_dataset(self) -> Self:
         if self.dataset_path is None and self.dataset not in _DATASET_ALIASES:
             raise ValueError(
                 f"perplexity: unknown dataset alias {self.dataset!r}. "
@@ -88,6 +137,49 @@ def _require_backend() -> None:
         )
 
 
+def weighted_mean(values: list[float], weights: list[int]) -> float:
+    """Token-weighted mean. Falls back to the unweighted mean if all weights are 0."""
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return sum(values) / len(values)
+    return sum(v * w for v, w in zip(values, weights, strict=True)) / total_weight
+
+
+def bootstrap_perplexity_ci(
+    nlls: list[float],
+    weights: list[int],
+    *,
+    resamples: int,
+    ci_level: float,
+    seed: int,
+) -> tuple[float, float] | None:
+    """Percentile-bootstrap CI for perplexity, resampling evaluation windows.
+
+    Returns ``(low, high)`` or ``None`` when there is too little data — see
+    ``_MIN_WINDOWS_FOR_CI``. Resamples the (nll, weight) pairs together so the
+    token weighting stays coherent within each replicate.
+    """
+    n = len(nlls)
+    if resamples <= 0 or n < _MIN_WINDOWS_FOR_CI:
+        return None
+
+    rng = random.Random(seed)
+    means: list[float] = []
+    for _ in range(resamples):
+        idx = [rng.randrange(n) for _ in range(n)]
+        means.append(
+            weighted_mean([nlls[i] for i in idx], [weights[i] for i in idx])
+        )
+    means.sort()
+
+    tail = (1.0 - ci_level) / 2.0
+    lo_idx = max(0, min(len(means) - 1, round(tail * (len(means) - 1))))
+    hi_idx = max(0, min(len(means) - 1, round((1.0 - tail) * (len(means) - 1))))
+    # exp() is monotonic, so exponentiating the NLL endpoints yields a valid
+    # percentile interval for perplexity itself.
+    return math.exp(means[lo_idx]), math.exp(means[hi_idx])
+
+
 class PerplexityEvaluator:
     name: ClassVar[str] = "perplexity"
 
@@ -99,18 +191,47 @@ class PerplexityEvaluator:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         model_path = _resolve_model_path(ctx, merge_adapter=cfg.merge_adapter)
-        ppl = _compute_perplexity(model_path, cfg)
+        nlls, weights = _window_nlls(model_path, cfg)
+
+        mean_nll = weighted_mean(nlls, weights)
+        ppl = math.exp(mean_nll)
+        ci = bootstrap_perplexity_ci(
+            nlls,
+            weights,
+            resamples=cfg.bootstrap_resamples,
+            ci_level=cfg.ci_level,
+            seed=cfg.seed,
+        )
 
         path, name, split, col = cfg.resolved_dataset()
-        report = {
+        report: dict[str, Any] = {
             "perplexity": ppl,
+            "ci_level": cfg.ci_level if ci else None,
+            "ci_low": ci[0] if ci else None,
+            "ci_high": ci[1] if ci else None,
+            "n_windows": len(nlls),
+            "n_scored_tokens": sum(weights),
+            "bootstrap_resamples": cfg.bootstrap_resamples if ci else 0,
             "model_path": model_path,
             "dataset": {"path": path, "name": name, "split": split, "text_column": col},
             "seq_len": cfg.seq_len,
         }
+        if ci is None:
+            report["ci_note"] = (
+                f"no interval reported: needs >= {_MIN_WINDOWS_FOR_CI} windows and "
+                "bootstrap_resamples > 0"
+            )
+        report["interpretation_note"] = (
+            "Perplexity measures fluency, not capability. Compression can hold "
+            "perplexity steady while degrading reasoning accuracy — use the "
+            "lm_eval_harness evaluator for capability claims."
+        )
         (out_dir / "perplexity.json").write_text(json.dumps(report, indent=2) + "\n")
 
         ctx.artifacts["perplexity"] = float(ppl)
+        if ci is not None:
+            ctx.artifacts["perplexity_ci"] = (float(ci[0]), float(ci[1]))
+            ctx.artifacts["perplexity_ci_level"] = cfg.ci_level
         ctx.artifacts["perplexity_report_path"] = str(out_dir / "perplexity.json")
         return ctx
 
@@ -118,12 +239,14 @@ class PerplexityEvaluator:
 def _resolve_model_path(ctx: StageContext, *, merge_adapter: bool) -> str:
     """Pick a loadable checkpoint path.
 
-    If a prior ``gptq`` stage ran, ``ctx.model_path`` already points at a full
+    If any compressor stage ran, ``ctx.model_path`` already points at a full
     quantized checkpoint — use it. Otherwise, if qlora left a bare adapter,
     merge it into the base (once, cached) so ``AutoModelForCausalLM`` can
     load it directly.
     """
-    if ctx.artifacts.get("gptq_model_path"):
+    # Every compressor sets `quantized_model_path`; the gptq-specific key is
+    # kept for recipes and artifacts written before that key existed.
+    if ctx.artifacts.get("quantized_model_path") or ctx.artifacts.get("gptq_model_path"):
         return ctx.model_path
 
     adapter_path = ctx.artifacts.get("qlora_adapter_path")
@@ -148,7 +271,12 @@ def _resolve_model_path(ctx: StageContext, *, merge_adapter: bool) -> str:
     return str(merged_dir)
 
 
-def _compute_perplexity(model_path: str, cfg: PerplexityConfig) -> float:
+def _window_nlls(model_path: str, cfg: PerplexityConfig) -> tuple[list[float], list[int]]:
+    """Score the corpus and return per-window (nll, scored_token_count).
+
+    Returning the per-window series rather than a single aggregate is what makes
+    the bootstrap possible — the windows are the resampling units.
+    """
     import torch
     from datasets import load_dataset
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -186,7 +314,8 @@ def _compute_perplexity(model_path: str, cfg: PerplexityConfig) -> float:
     window_len = min(cfg.seq_len, n_tokens)
     stride = cfg.stride or max(window_len // 2, 1)
 
-    nlls: list[torch.Tensor] = []
+    nlls: list[float] = []
+    weights: list[int] = []
     prev_end = 0
     for begin in range(0, n_tokens, stride):
         end = min(begin + window_len, n_tokens)
@@ -203,13 +332,12 @@ def _compute_perplexity(model_path: str, cfg: PerplexityConfig) -> float:
                 f"perplexity: non-finite loss at window [{begin}:{end}] — "
                 "check model dtype / device."
             )
-        nlls.append(loss)
+        nlls.append(float(loss.item()))
+        weights.append(int(trg_len))
         prev_end = end
         if end == n_tokens:
             break
 
     if not nlls:
         raise RuntimeError("perplexity: no evaluation windows produced.")
-
-    mean_nll = torch.stack(nlls).mean().item()
-    return math.exp(mean_nll)
+    return nlls, weights

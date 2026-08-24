@@ -1,6 +1,24 @@
 """GPTQ — Frantar et al. 2022, https://arxiv.org/abs/2210.17323.
 
-Backend: ``auto-gptq`` (Apache-2.0). Install via ``forgekit[gptq]``.
+Backend: ``gptqmodel`` (Apache-2.0). Install via ``forgekit[gptq]``.
+
+Backend migration (2026-08)
+---------------------------
+This plugin previously targeted ``auto-gptq``. That project was **archived on
+2025-04-11** and has been removed from ``transformers``; installing it against a
+current torch/transformers stack no longer resolves. ``gptqmodel`` is the
+maintained successor from the same lineage and is being upstreamed into
+transformers / optimum / peft.
+
+It is *not* import-compatible, which is why this is a rewrite rather than a pin
+bump. Three things changed:
+
+* ``AutoGPTQForCausalLM.from_pretrained(path, quantize_config=...)``
+  → ``GPTQModel.load(path, quant_config)``
+* ``model.save_quantized(dir)`` → ``model.save(dir)``
+* **Calibration data is now a list of raw strings.** The old API took
+  pre-tokenized ``{"input_ids", "attention_mask"}`` tensor dicts; ``gptqmodel``
+  tokenizes internally. Passing the old shape fails at quantize time.
 
 Takes a HF model path (possibly the merged output of a prior trainer stage),
 runs GPTQ calibration against a small text dataset, and writes a quantized
@@ -15,6 +33,14 @@ from typing import Any, ClassVar, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from forgekit.stages import StageContext
+
+# Rough bytes-per-token ratio for English text, used to trim calibration rows to
+# roughly `seq_len` tokens without paying to tokenize them first (gptqmodel
+# tokenizes internally, so an exact count here would be wasted work).
+_CHARS_PER_TOKEN = 4
+
+# Calibration rows shorter than this contribute almost no activation signal.
+_MIN_CALIBRATION_CHARS = 128
 
 
 class GPTQCalibrationDataset(BaseModel):
@@ -43,6 +69,13 @@ class GPTQConfig(BaseModel):
     desc_act: bool = False
     sym: bool = True
     damp_percent: float = 0.01
+    batch_size: int = Field(
+        default=1,
+        description=(
+            "Calibration batch size. Raise it to use more VRAM and quantize "
+            "faster; 1 is the safe default on 8-12 GB cards."
+        ),
+    )
     calibration: GPTQCalibrationDataset = Field(default_factory=GPTQCalibrationDataset)
     output_subdir: str = "gptq"
     merge_adapter: bool = True
@@ -52,10 +85,11 @@ def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
-def _require_auto_gptq() -> None:
-    if not _module_available("auto_gptq"):
+def _require_gptqmodel() -> None:
+    if not _module_available("gptqmodel"):
         raise RuntimeError(
-            "gptq: `auto-gptq` is not installed. Install via `forgekit[gptq]`."
+            "gptq: `gptqmodel` is not installed. Install via `forgekit[gptq]`. "
+            "(forgekit migrated off `auto-gptq`, which was archived 2025-04-11.)"
         )
 
 
@@ -64,30 +98,31 @@ class GPTQCompressor:
 
     def compress(self, ctx: StageContext) -> StageContext:
         cfg = GPTQConfig.model_validate(ctx.stage_config)
-        _require_auto_gptq()
+        _require_gptqmodel()
 
         out_dir = ctx.work_dir / cfg.output_subdir
         out_dir.mkdir(parents=True, exist_ok=True)
 
         source_model = _resolve_source_model(ctx, merge_adapter=cfg.merge_adapter)
+        calibration = _build_calibration_texts(cfg)
 
-        examples = _build_calibration_examples(source_model, cfg)
+        from gptqmodel import GPTQConfig as GPTQModelConfig
+        from gptqmodel import GPTQModel
 
-        from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
-
-        quantize_config = BaseQuantizeConfig(
+        quant_config = GPTQModelConfig(
             bits=cfg.bits,
             group_size=cfg.group_size,
             desc_act=cfg.desc_act,
             sym=cfg.sym,
             damp_percent=cfg.damp_percent,
         )
-        model = AutoGPTQForCausalLM.from_pretrained(
-            source_model, quantize_config=quantize_config
-        )
-        model.quantize(examples)
-        model.save_quantized(str(out_dir))
+        model = GPTQModel.load(source_model, quant_config)
+        model.quantize(calibration, batch_size=cfg.batch_size)
+        model.save(str(out_dir))
 
+        # gptqmodel writes the tokenizer alongside the weights when it loaded
+        # one, but a merged-adapter directory can arrive without it. Saving
+        # explicitly keeps the output loadable by vLLM / the exporters.
         from transformers import AutoTokenizer
 
         AutoTokenizer.from_pretrained(source_model).save_pretrained(str(out_dir))
@@ -95,6 +130,7 @@ class GPTQCompressor:
         ctx.artifacts["gptq_model_path"] = str(out_dir)
         ctx.artifacts["gptq_bits"] = cfg.bits
         ctx.artifacts["gptq_group_size"] = cfg.group_size
+        ctx.artifacts["quantized_model_path"] = str(out_dir)
         ctx.model_path = str(out_dir)
         return ctx
 
@@ -123,14 +159,13 @@ def _resolve_source_model(ctx: StageContext, *, merge_adapter: bool) -> str:
     return str(merged_dir)
 
 
-def _build_calibration_examples(model_path: str, cfg: GPTQConfig) -> list[dict[str, Any]]:
-    """Tokenize a small slice of a text dataset into GPTQ-style calibration batches."""
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
+def _build_calibration_texts(cfg: GPTQConfig) -> list[str]:
+    """Collect a small slice of a text dataset as raw calibration strings.
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    ``gptqmodel`` tokenizes internally, so this returns plain text — see the
+    module docstring for why this differs from the ``auto-gptq`` shape.
+    """
+    from datasets import load_dataset
 
     ds_kwargs: dict[str, Any] = {"split": cfg.calibration.split}
     if cfg.calibration.name is not None:
@@ -144,23 +179,20 @@ def _build_calibration_examples(model_path: str, cfg: GPTQConfig) -> list[dict[s
             f"gptq: calibration text_column {col!r} not in columns {ds.column_names}"
         )
 
-    examples: list[dict[str, Any]] = []
+    max_chars = cfg.calibration.seq_len * _CHARS_PER_TOKEN
+    texts: list[str] = []
     for row in ds:
         text = row[col]
-        if not text or not isinstance(text, str):
+        if not isinstance(text, str) or len(text) < _MIN_CALIBRATION_CHARS:
             continue
-        enc = tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=cfg.calibration.seq_len,
-        )
-        if enc["input_ids"].shape[1] < 16:
-            continue
-        examples.append({"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]})
-        if len(examples) >= cfg.calibration.num_samples:
+        texts.append(text[:max_chars])
+        if len(texts) >= cfg.calibration.num_samples:
             break
 
-    if not examples:
-        raise RuntimeError("gptq: could not build any calibration examples from dataset.")
-    return examples
+    if not texts:
+        raise RuntimeError(
+            "gptq: could not build any calibration examples from dataset "
+            f"{cfg.calibration.path!r} (need rows of at least "
+            f"{_MIN_CALIBRATION_CHARS} characters in column {col!r})."
+        )
+    return texts

@@ -1,0 +1,96 @@
+# QLoRA → AutoRound → vLLM.
+#
+# The recommended low-bit path. AutoRound learns the rounding decision with
+# signed gradient descent instead of applying a fixed rule, which is roughly
+# level with GPTQ/AWQ at 4 bits and clearly ahead at 3 and 2.
+#
+# Portability: nothing here is GB10-specific. `scheme: W3A16` runs on any CUDA
+# card, on ROCm, and on Apple Silicon. See the commented NVFP4 block at the
+# bottom for the Blackwell-only variant — forgekit refuses it on hardware
+# without FP4 tensor cores rather than silently producing a slow checkpoint.
+#
+#   just run recipes/qwen3_4b_qlora_autoround.yaml
+
+name: qwen3-4b-qlora-autoround
+model: Qwen/Qwen3-4B
+
+# NOTE: the top-level `data:` block is still a no-op in v0 (cli.py). Real
+# dataset configuration lives inside trainer.config.dataset.
+data:
+  kind: hf_dataset
+  config: {}
+
+trainer:
+  kind: qlora
+  config:
+    backend: auto # unsloth if importable, else trl
+    dataset:
+      path: tatsu-lab/alpaca
+      prompt_column: instruction
+      completion_column: output
+    lr: 2.0e-4
+    steps: 200
+    grad_accum: 4
+    lora_r: 16
+    lora_alpha: 32
+    # micro_batch_size and seq_len are omitted on purpose: forgekit derives
+    # them from measured VRAM, so this recipe sizes itself on a 12 GB laptop
+    # card and on a 128 GB GB10 without edits.
+
+compressors:
+  - kind: autoround
+    config:
+      # 3-bit is where AutoRound earns its keep. Drop to W2A16 if you need the
+      # memory more than the accuracy; raise to W4A16 to match a GPTQ baseline.
+      scheme: W3A16
+      # Emit a compressed-tensors checkpoint so the vLLM exporter downstream
+      # gets a directory it can load natively.
+      format: llm_compressor
+      nsamples: 128
+      iters: 200
+      # Turn this on if quantization OOMs on a small card — ~30% slower.
+      low_gpu_mem_usage: false
+
+evaluator:
+  # Perplexity is a cheap regression signal, not a capability measure. It now
+  # reports a bootstrap confidence interval alongside the point estimate;
+  # compare models by whether the intervals overlap, not by the third decimal.
+  #
+  # For any claim about whether the compressed model still *reasons*, swap this
+  # for the lm_eval_harness block below — compression degrades reasoning well
+  # before it moves perplexity.
+  kind: perplexity
+  config:
+    dataset: wikitext2
+    seq_len: 2048
+    bootstrap_resamples: 1000
+    ci_level: 0.95
+
+# evaluator:
+#   kind: lm_eval_harness
+#   config:
+#     tasks: [gsm8k, arc_challenge, hellaswag]
+#     batch_size: 8
+
+exporter:
+  kind: vllm
+  config:
+    dtype: auto
+    quantization: auto
+
+# --- Blackwell / GB10 variant ------------------------------------------------
+# NVFP4 is natively accelerated only on FP4 tensor cores. Whether it actually
+# beats FP8 on GB10 (sm_121) has depended on the vLLM and driver version — the
+# native SM120/121 CUTLASS NVFP4 GEMM landed mid-2026, and before that the
+# Marlin fallback dequantized FP4→BF16 and lost to FP8 outright.
+#
+# So: measure on your box before committing. `forgekit doctor` reports whether
+# this machine has FP4 at all.
+#
+# compressors:
+#   - kind: autoround
+#     config:
+#       scheme: NVFP4
+#       format: llm_compressor
+#       nsamples: 128
+#       iters: 200
